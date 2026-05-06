@@ -180,9 +180,12 @@ class BarangayAgent(mesa.Agent):
         
         # 2. If we have less tanods than the budget allows, spawn more
         if len(active_tanods) < self.n_enforcers:
-            for i in range(self.n_enforcers - len(active_tanods)):
-                tanod = EnforcementAgent(self.model.next_id(), self.model, self.unique_id)
-                tanod.is_municipal = False
+                for i in range(self.n_enforcers - len(active_tanods)):
+                    # Use your existing counter instead of next_id()
+                    tanod = EnforcementAgent(self.model.agent_id_counter, self.model, self.unique_id)
+                    self.model.agent_id_counter += 1
+                    
+                    tanod.is_municipal = False
                 
                 # Place them randomly at a household in their own barangay
                 households = self.model.households_by_bgy.get(self.unique_id, [])

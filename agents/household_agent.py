@@ -1,3 +1,5 @@
+from xml.parsers.expat import model
+
 import mesa
 import random
 import numpy as np
@@ -38,6 +40,16 @@ class HouseholdAgent(mesa.Agent):
         self.redeemed_this_quarter = False
         self.perceived_unfairness = False
         self.days_since_fined = 999 # <--- ADD THIS
+        
+        # Pull dynamic effort base from the model if it exists (for Sobol)
+        if hasattr(model, "c_effort_base_override"):
+            self.c_effort_base = model.c_effort_base_override
+        else:
+            self.c_effort_base = behavior_params["c_effort"]
+        
+        # Pull dynamic thresholds
+        self.t_high = getattr(model, "threshold_high", 0.70)
+        self.t_low = getattr(model, "threshold_low", 0.40)
 
     def update_social_norms(self):
         # 1. Calculate Local Compliance
@@ -65,33 +77,33 @@ class HouseholdAgent(mesa.Agent):
         # --- 2. Apply Social Shield (Inertia + Tipping Point) ---
         current_bgy_compliance = self.barangay.compliance_rate if self.barangay else 0.0
 
+        # --- Apply Social Shield ---
+        # Look directly at the model to ensure the sensitivity values are used
+        t_high = getattr(self.model, "threshold_high", 0.70)
+        t_low = getattr(self.model, "threshold_low", 0.40)
+
         if target_sn < self.sn: 
-            # DECAY PROTECTION (Your current logic)
-            if current_bgy_compliance > 0.70:
-                self.sn = (0.95 * self.sn) + (0.05 * target_sn) # Stronger Lock-in
-            elif current_bgy_compliance > 0.40:
+            if current_bgy_compliance > t_high:
+                self.sn = (0.95 * self.sn) + (0.05 * target_sn)
+            elif current_bgy_compliance > t_low:
                 self.sn = (0.85 * self.sn) + (0.15 * target_sn) 
             else:
                 self.sn = target_sn
         else:
-            # GROWTH MODE (The Tipping Point)
-            # BUFFED: Lowered the tipping point from 50% to 25%. 
-            # Once 1 in 4 neighbors segregate, the social pressure catches fire!
-            if current_bgy_compliance > 0.25:
+            # GROWTH MODE (The Tipping Point) - WAS MISSING
+            if current_bgy_compliance > t_low:
                 self.sn = min(1.0, target_sn * 1.30) # Amplified social pressure
             else:
                 self.sn = target_sn
-                    
-                self.sn = min(0.95, self.sn)
 
     def update_attitude(self):
         current_compliance = self.barangay.compliance_rate if self.barangay else 0.0
         
         # 1. Decay with Shielding
         decay_damper = 1.0
-        if current_compliance > 0.70:
+        if current_compliance > self.t_high:
             decay_damper = 0.05 
-        elif current_compliance > 0.40:
+        elif current_compliance > self.t_low:
             decay_damper = 0.50 
         
         self.attitude -= (self.attitude_decay_rate * decay_damper)
@@ -149,10 +161,10 @@ class HouseholdAgent(mesa.Agent):
         current_compliance = self.barangay.compliance_rate if self.barangay else 0.0
         effort_discount = 0.0
         
-        if current_compliance >= 0.70:
-            effort_discount = self.c_effort_base * 0.85  # 85% easier to segregate (Locked-in Habit)
-        elif current_compliance >= 0.40:
-            effort_discount = self.c_effort_base * 0.40  # 40% easier (Social Normalization)
+        if current_compliance >= self.t_high: # Use dynamic variable
+            effort_discount = self.c_effort_base * 0.85  
+        elif current_compliance >= self.t_low: # Use dynamic variable
+            effort_discount = self.c_effort_base * 0.40
 
         # Apply the discount to the base effort
         c_net = (self.c_effort_base - effort_discount) - (gamma * monetary_impact / 2000.0) 

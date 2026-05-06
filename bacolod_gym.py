@@ -18,14 +18,10 @@ class BacolodGymEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        # PASS THE DYNAMIC POLICY MODE HERE
+        # FIX: Only one initialization using the passed policy_mode
         self.model = BacolodModel(train_mode=True, policy_mode=self.policy_mode)
-        self.model = BacolodModel(train_mode=True, policy_mode="HuDRL")
         obs = self.model.get_state()
-        
-        # MUST BE HERE to prevent step 1 from crashing!
         self.prev_compliance = obs[0:7].copy() 
-        
         return obs, {}
     
     def _get_observation(self):
@@ -33,50 +29,49 @@ class BacolodGymEnv(gym.Env):
         return self.model.get_state()
 
     def step(self, action):
-        # 1. APPLY THE SAME 5.0 TEMPERATURE AS THE MAYOR AGENT
+        # 1. APPLY TEMPERATURE
+        # This converts the raw PPO output into amplified 'desire'.
+        # 10.0 makes the AI very decisive; 5.0 is more 'relaxed'.
         amplified = np.exp(action * 10.0)
         
-        # 2. APPLY THE SAME GRADUATION RULE (70%)
-        obs = self.model.get_state()
-        compliance_rates = obs[0:7]
-        for i in range(7):
-            if compliance_rates[i] >= 0.70:
-                amplified[i*3 : i*3+3] *= 0.01
-                
-        # 3. NORMALIZE
+        # 2. NORMALIZE TO RAW ACTION VECTOR
+        # We calculate the 'Raw Intent' of the AI first.
+        # We NO LONGER apply heuristics here; the Mayor will do that.
         total_desire = np.sum(amplified)
-        if total_desire > 0:
-            action_vector = amplified / total_desire
-        else:
-            action_vector = np.ones(21) / 21.0
+        action_vector = amplified / total_desire if total_desire > 0 else np.ones(21)/21.0
         
-        # --- EXECUTE AND ADVANCE SIMULATION ---
+        # 3. EXECUTE INTERVENTION (THE HEURISTIC LAYER)
+        # We pass the action_vector to the Mayor. 
+        # If policy_mode is "HuDRL", the Mayor will modify this vector 
+        # IN-PLACE using Graduation, Target Lock, and Phase-Shift.
         self.model.mayor.execute_intervention(action_vector)
         
+        # 4. ADVANCE SIMULATION
+        # Run for 90 ticks (one quarter).
         for _ in range(90):
             self.model.step() 
             if not self.model.running: 
                 break
 
-        # --- GATHER OBSERVATIONS ---
+        # 5. GATHER OBSERVATIONS
         obs = self.model.get_state()
         curr_compliance = obs[0:7]
         
-        # --- CALCULATE REWARD ---
+        # 6. CALCULATE REWARD
+        # The reward is calculated based on the FINAL action_vector 
+        # (after the Mayor's heuristics were applied).
         reward = self.calculate_reward(obs, action_vector, self.prev_compliance)
         
-        # --- UPDATE PREVIOUS COMPLIANCE FOR NEXT STEP ---
+        # 7. UPDATE PREVIOUS COMPLIANCE & ADD BONUSES
         self.prev_compliance = curr_compliance.copy()
-        
-        # --- ADD ATTITUDE BONUS ---
         avg_attitude = np.mean(obs[7:14])
         reward += (avg_attitude * 0.5)
         
-        # --- CHECK STOP CONDITIONS ---
+        # 8. CHECK STOP CONDITIONS
         terminated = not self.model.running
         truncated = False
         if terminated and self.model.political_capital < 0.10: 
-            reward -= 10.0 
+            reward -= 10.0
         
         info = {
             "quarter": self.model.quarter, 
@@ -96,8 +91,8 @@ class BacolodGymEnv(gym.Env):
         reward = global_compliance * 50.0  
         
         # 2. THE 70% SOCIAL NORM JACKPOT (Aligned with Graduation Rule)
-        if global_compliance >= 0.70: 
-            reward += 200.0                   
+        #if global_compliance >= 0.70: 
+        #    reward += 200.0                   
             
         compliance_gains = curr_compliance - prev_compliance
         

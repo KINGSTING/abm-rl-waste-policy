@@ -1,105 +1,127 @@
+import os
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from scipy import stats
 from stable_baselines3 import PPO
 from bacolod_gym import BacolodGymEnv
-import os
 
-def evaluate_agent(env, agent, episodes=5):
-    """Runs the environment for a set number of episodes and averages the results."""
-    metrics = {
-        "rewards": [],
-        "compliances": [],
-        "political_capitals": []
-    }
+# --- Configuration ---
+MODEL_PATH = "models/ppo/bacolod_ppo_final.zip"
+EPISODES = 5  # Independent seeds for statistical validation
+RESULTS_DIR = "results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
-    for ep in range(episodes):
-        obs, _ = env.reset()
+def calculate_cohens_d(group1, group2):
+    """Calculates effect size (magnitude of the performance gap)."""
+    n1, n2 = len(group1), len(group2)
+    var1, var2 = np.var(group1, ddof=1), np.var(group2, ddof=1)
+    # Handle edge case where variance is zero to avoid division by zero
+    if var1 + var2 == 0: return 0.0
+    pooled_std = np.sqrt(((n1 - 1) * var1 + (n2 - 1) * var2) / (n1 + n2 - 2))
+    return (np.mean(group1) - np.mean(group2)) / pooled_std
+
+def evaluate_policy(policy_type, agent=None):
+    """Runs the environment across EPISODES seeds and records raw reward data."""
+    env_mode = policy_type if policy_type in ["HuDRL", "Vanilla_DRL"] else "Vanilla_DRL"
+    env = BacolodGymEnv(policy_mode=env_mode)
+    raw_rewards = []
+
+    print(f"Evaluating {policy_type}...")
+
+    for seed in range(EPISODES):
+        obs, _ = env.reset(seed=seed)
         done = False
         truncated = False
-        total_reward = 0.0
+        ep_reward = 0.0
         
         while not (done or truncated):
-            # Deterministic=True means the AI uses its best learned policy without random exploration
-            action, _ = agent.predict(obs, deterministic=True)
-            obs, reward, done, truncated, info = env.step(action)
-            total_reward += reward
+            if agent and policy_type in ["HuDRL", "Vanilla_DRL"]:
+                action, _ = agent.predict(obs, deterministic=True)
+            elif policy_type == "Random":
+                action = env.action_space.sample()
+            elif policy_type == "Dirichlet":
+                # Dirichlet ensures the budget sums to 1.0 automatically
+                action = (np.random.dirichlet(np.ones(21)) * 2) - 1
+            elif policy_type == "Greedy":
+                # Logic: Find the weakest barangay and dump resources there
+                compliance_rates = obs[:7] 
+                weakest_idx = np.argmin(compliance_rates)
+                action = np.full(21, -1.0)
+                action[weakest_idx*3 : weakest_idx*3 + 3] = 1.0
+            
+            obs, reward, done, truncated, _ = env.step(action)
+            ep_reward += reward
 
-        metrics["rewards"].append(total_reward)
-        metrics["compliances"].append(info["compliance"] * 100) # Convert to percentage
-        metrics["political_capitals"].append(info["political_capital"] * 100) # Scale for chart
+        raw_rewards.append(ep_reward)
 
     return {
-        "avg_reward": np.mean(metrics["rewards"]),
-        "avg_compliance": np.mean(metrics["compliances"]),
-        "avg_pol_cap": np.mean(metrics["political_capitals"])
+        "name": policy_type,
+        "rewards_raw": raw_rewards,
+        "mean": np.mean(raw_rewards),
+        "std": np.std(raw_rewards)
     }
 
 def main():
-    model_path = "models/ppo/bacolod_ppo_final.zip"
-    
-    if not os.path.exists(model_path):
-        print(f"Error: Trained model not found at {model_path}")
-        print("Please run train_drl.py first!")
+    if not os.path.exists(MODEL_PATH):
+        print(f"Error: Model not found at {MODEL_PATH}")
         return
-
-    print("Loading Trained Agent...")
-    agent = PPO.load(model_path)
-
-    # 1. Evaluate HuDRL (Heuristics ON)
-    print("\nEvaluating HuDRL (With Target Lock & Guardrails)...")
-    env_hudrl = BacolodGymEnv(policy_mode="HuDRL")
-    hudrl_results = evaluate_agent(env_hudrl, agent, episodes=5)
-
-    # 2. Evaluate Vanilla PPO (Heuristics OFF)
-    print("Evaluating Vanilla PPO (No Heuristics)...")
-    env_vanilla = BacolodGymEnv(policy_mode="Vanilla_DRL") 
-    vanilla_results = evaluate_agent(env_vanilla, agent, episodes=5)
-
-    # --- Print Console Report ---
-    print("\n" + "="*50)
-    print("      HEURISTIC VS VANILLA PPO COMPARISON")
-    print("="*50)
-    print(f"{'Metric':<25} | {'HuDRL':<10} | {'Vanilla PPO':<10}")
-    print("-" * 50)
-    print(f"{'Avg Episode Reward':<25} | {hudrl_results['avg_reward']:<10.1f} | {vanilla_results['avg_reward']:<10.1f}")
-    print(f"{'Final Global Compliance':<25} | {hudrl_results['avg_compliance']:<9.1f}% | {vanilla_results['avg_compliance']:<9.1f}%")
-    print(f"{'Final Political Capital':<25} | {hudrl_results['avg_pol_cap']:<9.1f}% | {vanilla_results['avg_pol_cap']:<9.1f}%")
-    print("="*50)
-
-    # --- Generate Comparison Chart ---
-    labels = ['Avg Total Reward', 'Final Compliance (%)', 'Political Capital (%)']
     
-    # Scale reward down slightly just so it fits nicely on the same Y-axis as percentages
-    # (Adjust the / 10 if your rewards are massively higher or lower)
-    hudrl_bars = [hudrl_results['avg_reward'] / 10, hudrl_results['avg_compliance'], hudrl_results['avg_pol_cap']]
-    vanilla_bars = [vanilla_results['avg_reward'] / 10, vanilla_results['avg_compliance'], vanilla_results['avg_pol_cap']]
+    agent = PPO.load(MODEL_PATH)
+    policy_names = ["Random", "Dirichlet", "Greedy", "Vanilla_DRL", "HuDRL"]
+    results = [evaluate_policy(p, agent) for p in policy_names]
 
-    x = np.arange(len(labels))
-    width = 0.35
+    # --- Statistical Calculations ---
+    hu_res = next(r for r in results if r['name'] == "HuDRL")
+    greedy_res = next(r for r in results if r['name'] == "Greedy")
+    
+    # Welch's T-Test: Best Baseline (Greedy) vs Proposed (HuDRL)
+    t_stat, p_val = stats.ttest_ind(hu_res['rewards_raw'], greedy_res['rewards_raw'], equal_var=False)
+    d_size = calculate_cohens_d(hu_res['rewards_raw'], greedy_res['rewards_raw'])
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    rects1 = ax.bar(x - width/2, hudrl_bars, width, label='HuDRL (Heuristics ON)', color='#2ca02c')
-    rects2 = ax.bar(x + width/2, vanilla_bars, width, label='Vanilla PPO (Heuristics OFF)', color='#1f77b4')
+    # --- 1. Console Report ---
+    print("\n" + "="*80)
+    print(f"{'Algorithm':<15} | {'Mean Reward':<15} | {'Std Dev':<12} | {'Max Reward':<12}")
+    print("-" * 80)
+    for r in results:
+        print(f"{r['name']:<15} | {r['mean']:<15.2f} | {r['std']:<12.2f} | {max(r['rewards_raw']):<12.2f}")
+    print("="*80)
+    print(f"HuDRL vs Greedy Statistical Rigor: p-value = {p_val:.5f}, Cohen's d = {d_size:.2f}")
 
-    ax.set_ylabel('Score / Percentage')
-    ax.set_title('Ablation Study: Impact of Heuristic Guardrails on DRL Agent')
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.legend()
-    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    # --- 2. Save Data for Traceability ---
+    export_df = pd.DataFrame({r['name']: r['rewards_raw'] for r in results})
+    export_df.to_csv(os.path.join(RESULTS_DIR, "reward_raw_data.csv"), index=False)
 
-    # Add text labels on top of bars
-    ax.bar_label(rects1, padding=3, fmt='%.1f')
-    ax.bar_label(rects2, padding=3, fmt='%.1f')
+    # --- 3. Reward-Focused Visualization (Box Plot) ---
+    plt.style.use('seaborn-v0_8-muted') # Cleaner academic look
+    plt.figure(figsize=(10, 6))
+    
+    data_to_plot = [r['rewards_raw'] for r in results]
+    labels = [r['name'] for r in results]
+    
+    # notch=True helps visualize confidence intervals for the median
+    box = plt.boxplot(data_to_plot, labels=labels, patch_artist=True, notch=True)
+    
+    # IEEE-friendly color palette
+    colors = ['#bdc3c7', '#bdc3c7', '#95a5a6', '#e74c3c', '#2ecc71']
+    for patch, color in zip(box['boxes'], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.6)
 
+    # Add Significance Annotation
+    if p_val < 0.05:
+        x1, x2 = labels.index("Greedy") + 1, labels.index("HuDRL") + 1
+        y_max = max([max(r['rewards_raw']) for r in results])
+        y, h = y_max * 1.05, y_max * 0.02
+        plt.plot([x1, x1, x2, x2], [y, y+h, y+h, y], lw=1.5, c='black')
+        plt.text((x1+x2)*.5, y+h, f"p={p_val:.4f} (Significant)", ha='center', va='bottom', fontweight='bold')
+
+    plt.ylabel('Total Episodic Reward ($R_t$)')
+    plt.title(f'Policy Efficiency Comparison across {EPISODES} Seeds')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
     plt.tight_layout()
-    
-    # Save and show
-    os.makedirs("results", exist_ok=True)
-    chart_path = "results/hudrl_vs_vanilla.png"
-    plt.savefig(chart_path, dpi=300)
-    print(f"\n> Comparison chart saved successfully to: {chart_path}")
-    
+    plt.savefig(os.path.join(RESULTS_DIR, "reward_rigor_boxplot.png"), dpi=300)
     plt.show()
 
 if __name__ == "__main__":

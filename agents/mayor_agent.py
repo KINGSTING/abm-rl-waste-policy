@@ -89,6 +89,22 @@ class MayorAgent(mesa.Agent):
         # --- ONLY APPLY HEURISTICS IF IN HuDRL MODE ---
         if self.model.policy_mode == "HuDRL":
             # =================================================================
+            # 0. THE GRADUATION RULE (SUPPRESSION)
+            # Kill funding for barangays that have hit the 'Habit Shield' threshold.
+            # =================================================================
+            current_compliances = [b.get_local_compliance() for b in self.model.barangays]
+            for i in range(7):
+                if current_compliances[i] >= 0.70:
+                    # Artificially crush the allocation for successful barangays
+                    action_vector[i*3 : i*3+3] *= 0.01
+            
+            # Re-normalize immediately so the subsequent heuristics work with 
+            # the 'true' remaining budget.
+            total_remaining = np.sum(action_vector)
+            if total_remaining > 0:
+                action_vector[:] = action_vector / total_remaining
+                
+            # =================================================================
             # 1. 'TARGET LOCK' HEURISTIC (THE SWAP)
             # =================================================================
             compliances = [b.get_local_compliance() for b in self.model.barangays]

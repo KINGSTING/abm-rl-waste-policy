@@ -118,7 +118,6 @@ if __name__ == "__main__":
     rects2 = ax.bar(x + width/2, ST, width, label='Total-Order (ST)', color='#e74c3c')
 
     ax.set_ylabel('Sensitivity Index')
-    ax.set_title('Sobol Sensitivity Analysis of Citizen Segregation Drivers')
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=15, ha="right")
     ax.legend()
@@ -127,5 +126,5 @@ if __name__ == "__main__":
     plt.tight_layout()
     
     # Save the graph
-    plt.savefig('sobol_sensitivity_results.png', dpi=300)
-    print("\n[SUCCESS] Sensitivity graph saved as 'sobol_sensitivity_results.png'")
+    plt.savefig('sobol_sensitivity_results.svg', format='svg')
+    print("\n[SUCCESS] Sensitivity graph saved as 'sobol_sensitivity_results.svg'")

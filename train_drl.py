@@ -35,7 +35,7 @@ def train():
     print(f"Bacolod DRL: Fast-Track Training Started on {num_cpu} Cores...")
     model.learn(total_timesteps=TIMESTEPS, progress_bar=True)
     
-    model.save("models/ppo/bacolod_ppo_final")
+    model.save("models/ppo/bacolod_ppo_no_jackpot")
     print("\n[SUCCESS] Training Complete! Ready for your comparison.")
 
 if __name__ == "__main__":

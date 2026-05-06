@@ -20,7 +20,12 @@ def compute_global_compliance(model):
     return sum(1 for a in agents if a.is_compliant) / len(agents)
 
 class BacolodModel(mesa.Model):
-    def __init__(self, seed=None, train_mode=False, policy_mode="HuDRL", behavior_override=None): 
+    # =================================================================
+    # THE FIX: ADDED active_barangay TO THE ORIGINAL __init__
+    # =================================================================
+    def __init__(self, seed=None, train_mode=False, policy_mode="HuDRL", 
+                 active_barangay="BGY_0", behavior_override=None, current_view="BGY_0",
+                 sens_t_low=None, sens_t_high=None): # ADDED SENSITIVITY ARGS
         if seed is not None:
             super().__init__(seed=seed)
             self._seed = seed
@@ -29,198 +34,136 @@ class BacolodModel(mesa.Model):
         else:
             super().__init__()
 
-        self.train_mode = train_mode
-        self.rl_agent = None
-        self.tick = 0       
-        self.quarter = 1    
-        self.behavior_override = behavior_override
-
-        # ==============================================================
-        # THE UI FIX: SANITIZE DROPDOWN STRINGS
-        # Translates human-readable UI text (e.g. "Pure Enforcement") 
-        # into the strict keys the MayorAgent expects.
-        # ==============================================================
-        raw_policy = str(policy_mode).strip().lower()
-        if "enforcement" in raw_policy:
-            self.policy_mode = "pure_enforcement"
-        elif "incentive" in raw_policy:
-            self.policy_mode = "pure_incentives"
-        elif "hudrl" in raw_policy or "mayor" in raw_policy:
-            self.policy_mode = "HuDRL"
-        else:
-            self.policy_mode = "status_quo"
-        # ==============================================================
-
-        if self.behavior_override:
-            print(f"\n[INIT] Calibration Mode Active. Overriding config.")
-        else:
-            print(f"\n[INIT] BacolodModel created with Policy Mode: {self.policy_mode.upper()}")
-        
-        # =================================================================
-        # THREE SEPARATE CSV REPORTS (NOW WITH PERCENTAGES)
-        # =================================================================
-        results_dir = "results"
-        import os, csv # Ensure these are imported at the top of your file too!
-        if not os.path.exists(results_dir):
-            os.makedirs(results_dir)
-
-        self.csv_local = os.path.join(results_dir, f"{self.policy_mode}_1_LOCAL_BASE.csv")
-        self.csv_mayor = os.path.join(results_dir, f"{self.policy_mode}_2_MAYOR_INTERVENTION.csv")
-        self.csv_global = os.path.join(results_dir, f"{self.policy_mode}_3_GLOBAL_SUMMARY.csv")
-        
-        if not self.behavior_override:
-            # 1. LOCAL BARANGAY CSV
-            with open(self.csv_local, mode='w', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow([
-                    "Quarter", "Barangay", "Local_Base_Budget_PHP", 
-                    "Local_IEC_PHP", "Local_IEC_%", 
-                    "Local_Enf_PHP", "Local_Enf_%", 
-                    "Local_Inc_PHP", "Local_Inc_%", 
-                    "Local_Tanods_Active", "Local_Compliance"
-                ])
-            # 2. MAYOR LGU CSV 
-            with open(self.csv_mayor, mode='w', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow([
-                    "Quarter", "Barangay", "Mayor_Total_Given_PHP", "Share_of_LGU_Budget_%",
-                    "Mayor_IEC_PHP", "Mayor_IEC_%", 
-                    "Mayor_Enf_PHP", "Mayor_Enf_%", 
-                    "Mayor_Inc_PHP", "Mayor_Inc_%", 
-                    "Municipal_Inspectors_Deployed"
-                ])
-            # 3. GLOBAL CSV 
-            with open(self.csv_global, mode='w', newline='') as file:
-                writer = csv.writer(file)
-                writer.writerow([
-                    "Quarter", "Global_Compliance", "Political_Capital", 
-                    "Total_Fines_Collected", "Avg_City_Attitude"
-                ])
-
-        if not self.train_mode and self.policy_mode == "HuDRL" and not self.behavior_override:
-            model_path = "models/ppo/bacolod_ppo_final.zip"
-            if os.path.exists(model_path):
-                print(f"Loading Trained Agent from {model_path}...")
-                self.rl_agent = PPO.load(model_path)
-            else:
-                print("Warning: No trained model found. Will default to Status Quo.")
-
-        self.annual_budget = config.ANNUAL_BUDGET
-        self.current_budget = self.annual_budget
-        self.quarterly_budget = self.annual_budget / 4 
-        
-        self.total_fines_collected = 0
-        self.total_incentives_distributed = 0
-        self.total_enforcement_cost = 0
-        self.total_iec_cost = 0
-        self.recent_fines_collected = 0
-
+        # 1. CORE MESA INFRASTRUCTURE (Define FIRST)
         self.grid_width = 50   
         self.grid_height = 50 
         self.grid = MultiGrid(self.grid_width, self.grid_height, torus=False)
         self.schedule = RandomActivation(self)
         self.running = True
-        
-        # --- FIXED POLITICAL CAPITAL MATH ---
-        self.political_capital = 1.0     
-        self.alpha_sensitivity = 0.0010 # High enough to cause collapse if strictly abused
-        self.beta_recovery = 0.0002      # Slow recovery if they ease up
 
+        # 2. MODEL CLOCKS & VARIABLES
+        self.tick = 0       
+        self.quarter = 1    
+        self.train_mode = train_mode
+        self.behavior_override = behavior_override
+        
+        # THE FIX: Save the sensitivity arguments as instance attributes
+        self.sens_t_low = sens_t_low
+        self.sens_t_high = sens_t_high
+        
+        # These are what the HouseholdAgent looks for
+        self.threshold_low = sens_t_low if sens_t_low is not None else 0.40
+        self.threshold_high = sens_t_high if sens_t_high is not None else 0.70
+
+        # Policy String Sanitization
+        raw_policy = str(policy_mode).strip().lower()
+        if "enforcement" in raw_policy: self.policy_mode = "pure_enforcement"
+        elif "incentive" in raw_policy: self.policy_mode = "pure_incentives"
+        elif "hudrl" in raw_policy or "mayor" in raw_policy: self.policy_mode = "HuDRL"
+        else: self.policy_mode = "status_quo"
+
+        # 3. CSV LOGGING SETUP
+        results_dir = "results"
+        if not os.path.exists(results_dir): os.makedirs(results_dir)
+        self.csv_local = os.path.join(results_dir, f"{self.policy_mode}_1_LOCAL_BASE.csv")
+        self.csv_mayor = os.path.join(results_dir, f"{self.policy_mode}_2_MAYOR_INTERVENTION.csv")
+        self.csv_global = os.path.join(results_dir, f"{self.policy_mode}_3_GLOBAL_SUMMARY.csv")
+        
+        # Only write headers if we aren't in a parallel test
+        if not self.behavior_override and not self.train_mode:
+            self._initialize_csv_headers()
+
+        # 4. LOAD RL MODEL (FIXED: Allow loading during sensitivity tests)
+        if self.policy_mode == "HuDRL":
+            model_path = "models/ppo/bacolod_ppo_final.zip"
+            if os.path.exists(model_path):
+                # Using CPU for multiprocessing stability
+                self.rl_agent = PPO.load(model_path, device="cpu")
+                if not self.train_mode: print(f"HuDRL Brain Active.")
+
+        # Budget & Political Capital Params
+        self.annual_budget = config.ANNUAL_BUDGET
+        self.current_budget = self.annual_budget
+        self.quarterly_budget = self.annual_budget / 4 
+        self.total_fines_collected = 0
+        self.total_incentives_distributed = 0
+        self.total_enforcement_cost = 0
+        self.total_iec_cost = 0
+        self.recent_fines_collected = 0
+        self.political_capital = 1.0     
+        self.alpha_sensitivity = 0.0010 
+        self.beta_recovery = 0.0002      
+
+        # 5. AGENT CREATION
         self.barangays = []
         self.agent_id_counter = 0
         self.households_by_bgy = {}
         
-        # --- INITIALIZE BARANGAYS ---
         for i, b_conf in enumerate(config.BARANGAY_LIST):
             b_agent = BarangayAgent(f"BGY_{i}", self, local_budget=b_conf["local_budget"])
             b_agent.name = b_conf["name"]
             b_agent.n_households = b_conf["N_HOUSEHOLDS"]
-            
             if "allocation_profile" in b_conf:
-                profile_key = b_conf["allocation_profile"]
-                if hasattr(config, 'ALLOCATION_PROFILES'):
-                     b_agent.local_allocation_ratios = config.ALLOCATION_PROFILES.get(profile_key, config.ALLOCATION_PROFILES["Ezperanza"])
-
+                pk = b_conf["allocation_profile"]
+                b_agent.local_allocation_ratios = config.ALLOCATION_PROFILES.get(pk, config.ALLOCATION_PROFILES["Ezperanza"])
             self.schedule.add(b_agent)
             self.barangays.append(b_agent)
             
+            # Behavior Data + Sensitivity Injection
             profile_key = b_conf.get("behavior_profile", "Poblacion") 
-            if self.behavior_override:
-                behavior_data = self.behavior_override.get(profile_key, config.BEHAVIOR_PROFILES["Poblacion"])
-            else:
-                behavior_data = config.BEHAVIOR_PROFILES.get(profile_key, config.BEHAVIOR_PROFILES["Poblacion"])
-
-            n_households = b_conf["N_HOUSEHOLDS"]
-            profile_key_income = b_conf["income_profile"]
-            income_probs = list(config.INCOME_PROFILES[profile_key_income])
+            behavior_data = config.BEHAVIOR_PROFILES.get(profile_key, config.BEHAVIOR_PROFILES["Poblacion"]).copy()
             
-            for _ in range(n_households):
+            # Now self.sens_t_low and self.sens_t_high exist!
+            if self.sens_t_low is not None: 
+                behavior_data["threshold_low"] = self.sens_t_low
+            if self.sens_t_high is not None: 
+                behavior_data["threshold_high"] = self.sens_t_high
+
+            income_probs = list(config.INCOME_PROFILES[b_conf["income_profile"]])
+            for _ in range(b_conf["N_HOUSEHOLDS"]):
                 x = self.random.randrange(self.grid_width)
                 y = self.random.randrange(self.grid_height)
                 income = np.random.choice([1, 2, 3], p=income_probs)
                 is_compliant = (random.random() < b_conf["initial_compliance"])
-                
-                a = HouseholdAgent(
-                    self.agent_id_counter, 
-                    self, 
-                    income_level=income, 
-                    initial_compliance=is_compliant,
-                    behavior_params=behavior_data 
-                )
+                a = HouseholdAgent(self.agent_id_counter, self, income, is_compliant, behavior_data)
                 self.agent_id_counter += 1
                 a.barangay = b_agent
                 a.barangay_id = b_agent.unique_id
-                
-                if b_agent.unique_id not in self.households_by_bgy:
-                    self.households_by_bgy[b_agent.unique_id] = []
+                if b_agent.unique_id not in self.households_by_bgy: self.households_by_bgy[b_agent.unique_id] = []
                 self.households_by_bgy[b_agent.unique_id].append(a)
-                
                 self.schedule.add(a)
                 self.grid.place_agent(a, (x, y))
 
+        # 6. MAYOR & PRE-FILTERED LISTS
         self.mayor = MayorAgent("MAYOR_0", self, self.quarterly_budget)
         self.schedule.add(self.mayor)
         self.mayor.run_decision_logic() 
 
-        # ==============================================================
-        # UI GRAPH FIX: Multiply by 100 to convert decimals to percentages
-        # ==============================================================
-        reporters = {
+        # OPTIMIZATION: Create static lists so we don't loop over 'schedule.agents' every step
+        self.household_list = [a for a in self.schedule.agents if isinstance(a, HouseholdAgent)]
+        self.decision_list = [a for a in self.schedule.agents if isinstance(a, (HouseholdAgent, EnforcementAgent, MayorAgent))]
+
+        self.datacollector = DataCollector(model_reporters={
             "Global Compliance": lambda m: compute_global_compliance(m) * 100.0,
             "Total Fines": lambda m: m.total_fines_collected,
             "Political Capital": lambda m: m.political_capital
-        }
-        
-        for bgy in self.barangays:
-             # Multiply individual barangay lines by 100 as well
-             reporters[bgy.name] = lambda m, b=bgy: b.get_local_compliance() * 100.0
-
-        self.datacollector = DataCollector(model_reporters=reporters)
+        })
         self.datacollector.collect(self)
 
     def update_political_capital(self):
-        # 1. Calculate the raw enforcement pressure
         avg_enforcement = 0
         if self.barangays:
             avg_enforcement = sum(b.enforcement_intensity for b in self.barangays) / len(self.barangays)
             
-        # 2. Calculate the Citizens' Average Attitude (The "Incentive Shield")
         all_households = [a for a in self.schedule.agents if isinstance(a, HouseholdAgent)]
         if all_households:
             avg_attitude = np.mean([a.attitude for a in all_households])
         else:
             avg_attitude = 0.5 
             
-        # 3. The Holland (2017) Buffer: 
-        # Attitude ranges from 0.0 to 1.0. 
-        # If attitude is 0.8 (Very Happy), modifier becomes 0.4 (Decay is cut by 60%)
-        # If attitude is 0.2 (Very Angry), modifier becomes 1.6 (Decay is 60% faster)
         attitude_modifier = 2.0 * (1.0 - avg_attitude)
-        
-        # 4. Apply the modifier to the decay
         effective_decay = (self.alpha_sensitivity * avg_enforcement) * attitude_modifier
         recovery = self.beta_recovery * (1.0 - avg_enforcement)
-        
         self.political_capital = max(0.0, min(1.0, self.political_capital - effective_decay + recovery))
 
     def calculate_costs(self):
@@ -267,7 +210,6 @@ class BacolodModel(mesa.Model):
             writer_mayor = csv.writer(file_mayor)
 
             for b in self.barangays:
-                # --- 1. LOCAL DATA (WITH PERCENTAGES) ---
                 local_total = b.local_quarterly_budget
                 l_iec_pct = (b.iec_fund / local_total * 100) if local_total > 0 else 0
                 l_enf_pct = (b.enf_fund / local_total * 100) if local_total > 0 else 0
@@ -286,7 +228,6 @@ class BacolodModel(mesa.Model):
                     local_tanods, f"{b.get_local_compliance():.2%}"
                 ])
 
-                # --- 2. MAYOR DATA (WITH PERCENTAGES) ---
                 lgu_iec = getattr(b, 'lgu_iec_fund', 0)
                 lgu_enf = getattr(b, 'lgu_enf_fund', 0)
                 lgu_inc = getattr(b, 'lgu_incentive_fund', 0)
@@ -296,7 +237,6 @@ class BacolodModel(mesa.Model):
                 m_enf_pct = (lgu_enf / lgu_total * 100) if lgu_total > 0 else 0
                 m_inc_pct = (lgu_inc / lgu_total * 100) if lgu_total > 0 else 0
                 
-                # How much of the TOTAL municipal budget did this barangay get?
                 m_share_overall = (lgu_total / self.quarterly_budget * 100) if self.quarterly_budget > 0 else 0
                 
                 lgu_inspectors = len([a for a in self.schedule.agents 
@@ -316,7 +256,6 @@ class BacolodModel(mesa.Model):
                 if households:
                     all_attitudes.extend([a.attitude for a in households])
 
-        # --- 3. GLOBAL DATA ---
         with open(self.csv_global, mode='a', newline='') as file_global:
             writer_global = csv.writer(file_global)
             global_comp = compute_global_compliance(self)
@@ -332,26 +271,25 @@ class BacolodModel(mesa.Model):
 
     def step(self):
         self.tick += 1
-        
-        # ==============================================================
-        # UI FIX 1: THE X-AXIS TIME TRACKER
-        # Mesa's visual graphs REQUIRE this to move the lines forward!
-        # ==============================================================
         self.schedule.steps += 1
         self.schedule.time += 1
 
+        # 1. Quarterly logic
         if self.tick % 90 == 0:
             self.quarter += 1
-            for a in self.schedule.agents:
-                if isinstance(a, HouseholdAgent):
-                    a.redeemed_this_quarter = False
+            # We still use household_list here because Households are never 'deleted'
+            for a in self.household_list:
+                a.redeemed_this_quarter = False
             
             if not self.train_mode and not self.behavior_override:
                 print(f" >> New Quarter: {self.quarter}")
 
+        # 2. Step Barangays
         for b in self.barangays: 
             b.step()
             
+        # 3. THE DYNAMIC FIX: Loop through the actual schedule
+        # This ensures Municipal Inspectors actually 'act'
         for a in self.schedule.agents:
             if isinstance(a, (HouseholdAgent, EnforcementAgent, MayorAgent)):
                 a.step()
@@ -359,25 +297,13 @@ class BacolodModel(mesa.Model):
         self.update_political_capital() 
         self.calculate_costs()
 
-        # ==============================================================
-        # UI FIX 2: THE DATA COLLECTOR (You accidentally deleted this!)
-        # This MUST run every step so the graph can read the barangay compliance.
-        # ==============================================================
         if not self.train_mode:
             self.datacollector.collect(self)
 
-        max_ticks = 3600 if self.train_mode else 1080
-        
-        if self.tick >= max_ticks: 
+        # 12 Quarters = 1080 ticks
+        if self.tick >= 1080: 
             self.running = False
-            
-        # FIX: RESTORED THIS HALT CONDITION!
-        # This prevents the "Zombie Mayor" from getting healed at the end of the quarter.
-        # If they act like a dictator and drop below 10%, the simulation halts IMMEDIATELY.
-        if self.political_capital <= 0.10 and not self.train_mode:
-             print("SIMULATION HALTED (Political Collapse).")
-             self.running = False
-
+             
     def get_state(self):
         compliance_rates = [b.get_local_compliance() for b in self.barangays]
         attitude_rates = []
@@ -388,8 +314,39 @@ class BacolodModel(mesa.Model):
             attitude_rates.append(avg_att)
 
         norm_budget = max(0.0, min(1.0, self.current_budget / self.annual_budget))
-        norm_time = max(0.0, min(1.0, self.quarter / 40.0))
+        norm_time = max(0.0, min(1.0, self.quarter / 12.0))
         p_cap = max(0.0, min(1.0, self.political_capital)) 
         
         state = compliance_rates + attitude_rates + [norm_budget, norm_time, p_cap]
         return np.array(state, dtype=np.float32)
+    
+    # INDENT THIS BLOCK BY 4 SPACES
+    def _initialize_csv_headers(self):
+        """Initializes the CSV files with their respective header rows."""
+        import csv
+        
+        # 1. Local Base Headers
+        with open(self.csv_local, mode='w', newline='') as file_local:
+            writer_local = csv.writer(file_local)
+            writer_local.writerow([
+                "Quarter", "Barangay", "Local Budget", 
+                "IEC Fund", "IEC %", "ENF Fund", "ENF %", 
+                "INC Fund", "INC %", "Local Tanods", "Compliance Rate"
+            ])
+
+        # 2. Mayor Intervention Headers
+        with open(self.csv_mayor, mode='w', newline='') as file_mayor:
+            writer_mayor = csv.writer(file_mayor)
+            writer_mayor.writerow([
+                "Quarter", "Barangay", "LGU Total", "LGU Share %",
+                "LGU IEC", "LGU IEC %", "LGU ENF", "LGU ENF %", 
+                "LGU INC", "LGU INC %", "LGU Inspectors"
+            ])
+
+        # 3. Global Summary Headers
+        with open(self.csv_global, mode='w', newline='') as file_global:
+            writer_global = csv.writer(file_global)
+            writer_global.writerow([
+                "Quarter", "Global Compliance", "Political Capital", 
+                "Total Fines Collected", "Average Attitude"
+            ])

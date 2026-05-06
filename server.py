@@ -2,220 +2,188 @@ import mesa
 from mesa.visualization.modules import CanvasGrid, ChartModule, TextElement
 from mesa.visualization.ModularVisualization import ModularServer
 from mesa.visualization.UserParam import Choice
+import json
 
-# Import your custom agents and model
 from agents.bacolod_model import BacolodModel
 from agents.household_agent import HouseholdAgent
 from agents.enforcement_agent import EnforcementAgent
 from agents.barangay_agent import BarangayAgent
 
-# --- 1. Portrayal Factory ---
-def make_barangay_portrayal(barangay_target_id):
-    def local_portrayal(agent):
-        if agent is None: return None
+# =========================================================================
+# THE MONKEY PATCH: Intercepting Custom WebSocket Commands
+# =========================================================================
+from mesa.visualization.ModularVisualization import SocketHandler
+
+original_on_message = SocketHandler.on_message
+
+def custom_on_message(self, message):
+    try:
+        msg = json.loads(message)
+        if msg.get("type") == "switch_view":
+            print(f"\n[SUCCESS] Web UI requested map switch to: {msg['value']}")
+            if hasattr(self.application, 'model'):
+                self.application.model.current_view = msg["value"]
+            return  
+    except Exception as e:
+        print(f"WebSocket Error: {e}")
         
-        # Filter: Only show agents belonging to this specific Barangay Grid
-        if hasattr(agent, 'barangay_id') and agent.barangay_id != barangay_target_id: return None
-        if isinstance(agent, BarangayAgent) and agent.unique_id != barangay_target_id: return None
+    original_on_message(self, message)
 
-        portrayal = {}
-        agent_class = type(agent).__name__
+SocketHandler.on_message = custom_on_message
+# =========================================================================
+
+
+# --- 1. The Phantom Portrayal ---
+def dynamic_portrayal(agent):
+    if agent is None: return None
+    
+    target_bgy = getattr(agent.model, 'current_view', "BGY_0")
+    b_id = getattr(agent, 'barangay_id', None)
+    if b_id is None:
+        b_id = getattr(agent, 'unique_id', None) 
         
-        if agent_class == "HouseholdAgent":
-            portrayal["Shape"] = "circle"
-            portrayal["Filled"] = "true"
-            portrayal["r"] = 0.5   
-            portrayal["Layer"] = 0
-            is_compliant = getattr(agent, "is_compliant", False)
-            portrayal["Color"] = "green" if is_compliant else "red"
-            
-        elif agent_class == "EnforcementAgent":
-            portrayal["Shape"] = "rect"
-            portrayal["Filled"] = "true"
-            portrayal["Layer"] = 1
-            
-            # --- VISUAL MULTI-LAYERED GOVERNANCE ---
-            if getattr(agent, "is_municipal", False):
-                portrayal["w"] = 0.9  
-                portrayal["h"] = 0.9
-                portrayal["Color"] = "purple" 
-                portrayal["text"] = "M"       
-                portrayal["text_color"] = "white"
-            else:
-                portrayal["w"] = 0.7  
-                portrayal["h"] = 0.7
-                portrayal["Color"] = "blue"   
-                portrayal["text"] = "T"       
-                portrayal["text_color"] = "white"
-            
-        elif agent_class == "BarangayAgent":
-            portrayal["Shape"] = "circle"
-            portrayal["Filled"] = "true"
-            portrayal["r"] = 1.0  
-            portrayal["Layer"] = 2
-            portrayal["Color"] = "black"
-            
-        return portrayal
-    return local_portrayal
+    if b_id != target_bgy: 
+        return None
 
-# --- 2. UI Layout Classes ---
+    portrayal = {"Filled": "true"}
+    agent_class = agent.__class__.__name__ 
+    
+    if agent_class == "HouseholdAgent":
+        portrayal["Shape"] = "circle"
+        portrayal["r"] = 0.5   
+        portrayal["Layer"] = 0
+        portrayal["Color"] = "green" if getattr(agent, "is_compliant", False) else "red"
+        
+    elif agent_class == "EnforcementAgent":
+        is_mun = getattr(agent, "is_municipal", False)
+        portrayal["Shape"] = "rect"
+        portrayal["Layer"] = 1
+        portrayal["w"] = 0.9 if is_mun else 0.7
+        portrayal["h"] = 0.9 if is_mun else 0.7
+        portrayal["Color"] = "purple" if is_mun else "blue"
+        portrayal["text"] = "M" if is_mun else "T"
+        portrayal["text_color"] = "white"
+        
+    elif agent_class == "BarangayAgent":
+        portrayal["Shape"] = "circle"
+        portrayal["r"] = 1.0  
+        portrayal["Layer"] = 2
+        portrayal["Color"] = "black"
+        
+    return portrayal
 
-class Spacer(mesa.visualization.TextElement):
-    def render(self, model):
-        return '<div style="height: 850px; width: 100%; display: block; z-index: -1;"></div>'
-
+# --- 2. Live Map Switcher & Chart Labeler ---
 class ViewSwitcher(mesa.visualization.TextElement):
+    def __init__(self):
+        self.first_render = True
+
     def render(self, model):
+        if not self.first_render:
+            return ""
+        
+        self.first_render = False
+        
         return """
-        <div class="switcher-container">
-            <div class="switcher-box">
-                <h4>Active Simulation View</h4>
-                <div class="btn-group" id="bgy-btn-group">
-                    <button id="btn_0" class="bgy-btn active" onclick="window.switchView(0)">Poblacion</button>
-                    <button id="btn_1" class="bgy-btn" onclick="window.switchView(1)">Liangan East</button>
-                    <button id="btn_2" class="bgy-btn" onclick="window.switchView(2)">Ezperanza</button>
-                    <button id="btn_3" class="bgy-btn" onclick="window.switchView(3)">Binuni</button>
-                    <button id="btn_4" class="bgy-btn" onclick="window.switchView(4)">Demologan</button> 
-                    <button id="btn_5" class="bgy-btn" onclick="window.switchView(5)">Mati</button>
-                    <button id="btn_6" class="bgy-btn" onclick="window.switchView(6)">Babalaya</button>
-                </div>
+        <div id="stable-ui-container" style="width: 100%; text-align: center; margin-bottom: 20px;">
+            <div style="padding: 15px; background: #ffffff; border-radius: 8px; border: 2px solid #28a745; display: inline-block; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                <h4 style="margin-top: 0; color: #333;">Live Barangay View Selector</h4>
+                <select id="live-bgy-select" style="padding: 8px 24px; font-size: 16px; font-weight: bold; border-radius: 4px; border: 1px solid #ccc; cursor: pointer; background: #f8f9fa;" onchange="updatePythonView()">
+                    <option value="BGY_0">Poblacion</option>
+                    <option value="BGY_1">Liangan East</option>
+                    <option value="BGY_2">Ezperanza</option>
+                    <option value="BGY_3">Binuni</option>
+                    <option value="BGY_4">Demologan</option>
+                    <option value="BGY_5">Mati</option>
+                    <option value="BGY_6">Babalaya</option>
+                </select>
             </div>
-            
-            <img src="x" style="display:none;" onerror="
-                if (!window.switchView) {
-                    window.switchView = function(targetIndex) {
-                        // 1. Handle Maps
-                        let maps = document.getElementsByClassName('world-grid-parent');
-                        if (maps.length < 7) { 
-                            setTimeout(() => window.switchView(targetIndex), 100); 
-                            return; 
-                        }
-                        
-                        targetIndex = parseInt(targetIndex);
-                        for (let i = 0; i < 7; i++) {
-                            let mapBox = maps[i];
-                            if (i === targetIndex) {
-                                mapBox.style.opacity = '1'; 
-                                mapBox.style.zIndex = '100'; 
-                                mapBox.style.pointerEvents = 'auto';
-                                mapBox.style.border = '2px solid #007bff';
-                            } else {
-                                mapBox.style.opacity = '0'; 
-                                mapBox.style.zIndex = '1'; 
-                                mapBox.style.pointerEvents = 'none';
-                                mapBox.style.border = 'none';
-                            }
-                        }
-
-                        // 2. Handle Buttons
-                        let container = document.getElementById('bgy-btn-group');
-                        if (container) {
-                            let btns = container.getElementsByClassName('bgy-btn');
-                            for(let i = 0; i < btns.length; i++) {
-                                btns[i].classList.remove('active');
-                            }
-                            let activeBtn = document.getElementById('btn_' + targetIndex);
-                            if(activeBtn) {
-                                activeBtn.classList.add('active');
-                            }
-                        }
-
-                        // ==========================================================
-                        // 3. THE BULLETPROOF PADDING FIX
-                        // ==========================================================
-                        let canvases = document.getElementsByTagName('canvas');
-                        if(canvases.length > 0) {
-                            let chartCanvas = canvases[canvases.length - 1]; 
-                            let chartContainer = chartCanvas.parentElement;
-                            
-                            if(!document.getElementById('thesis-y-axis')) {
-                                // 1. Generate safe, physical whitespace around the graph
-                                chartContainer.style.position = 'relative';
-                                chartContainer.style.padding = '20px 70px 60px 120px'; // Top, Right, Bottom, Left
-                                chartContainer.style.boxSizing = 'content-box';
-                                chartContainer.style.width = '1000px'; 
-                                chartContainer.style.margin = '40px auto'; 
-                                
-                                // 2. Y-Axis Label (Nested perfectly in the left padding)
-                                let yLabel = document.createElement('div');
-                                yLabel.id = 'thesis-y-axis';
-                                yLabel.innerHTML = 'Compliance Rate (%)';
-                                yLabel.style.position = 'absolute';
-                                yLabel.style.left = '15px'; 
-                                yLabel.style.top = '84%';
-                                yLabel.style.transform = 'translateY(-50%) rotate(-90deg)';
-                                yLabel.style.fontWeight = 'bold';
-                                yLabel.style.fontSize = '18px';
-                                yLabel.style.fontFamily = 'Arial, sans-serif';
-                                yLabel.style.color = '#333';
-                                chartContainer.appendChild(yLabel);
-                                
-                                // 3. X-Axis Label (Nested perfectly in the bottom padding)
-                                let xLabel = document.createElement('div');
-                                xLabel.id = 'thesis-x-axis';
-                                xLabel.innerHTML = 'Ticks (Days)';
-                                xLabel.style.position = 'absolute';
-                                xLabel.style.bottom = '15px';
-                                xLabel.style.left = '50%';
-                                xLabel.style.transform = 'translateX(-50%)';
-                                xLabel.style.fontWeight = 'bold';
-                                xLabel.style.fontSize = '18px';
-                                xLabel.style.fontFamily = 'Arial, sans-serif';
-                                xLabel.style.color = '#333';
-                                chartContainer.appendChild(xLabel);
-                            }
-                        }
-                    };
-                    
-                    setTimeout(() => window.switchView(0), 500);
-                }
-            ">
-
-            <style>
-                .world-grid-parent {
-                    position: absolute !important;
-                    top: 360px; 
-                    left: 60% !important;           
-                    transform: translateX(-50%) !important; 
-                    margin: 0 !important;
-                    width: 600px !important; 
-                    height: 600px !important;
-                    transition: opacity 0.3s ease;
-                    background: white;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-                    border-radius: 4px;
-                }
-                .switcher-container {
-                    width: 100%; text-align: center; padding: 15px; 
-                    background: white; z-index: 9999 !important; position: relative;
-                    display: flex; justify-content: center;
-                }
-                .switcher-box {
-                    padding: 15px; background: #f8f9fa; border-radius: 8px;
-                    border: 1px solid #dee2e6;
-                }
-                .bgy-btn { 
-                    padding: 10px 20px; margin: 2px; border: 1px solid #aaa; 
-                    cursor: pointer; border-radius: 4px; background: #f8f9fa; font-weight: bold;
-                }
-                .bgy-btn.active { background-color: #007bff !important; color: white !important; border-color: #0056b3 !important; }
-                .bgy-btn:hover { background: #e2e6ea; }
-            </style>
         </div>
+
+        <img src="data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==" style="display:none;" onload="
+            if (!window.uiDetached) {
+                window.uiDetached = true;
+                
+                // 1. Move Dropdown
+                setTimeout(() => {
+                    let ui = document.getElementById('stable-ui-container');
+                    let elementsDiv = document.getElementById('elements'); 
+                    if (ui && elementsDiv) {
+                        elementsDiv.insertBefore(ui, elementsDiv.firstChild);
+                    }
+                }, 100);
+
+                // 2. WebSocket Sender
+                window.updatePythonView = function() {
+                    let selectEl = document.getElementById('live-bgy-select');
+                    let selected = selectEl.value;
+                    
+                    selectEl.style.borderColor = '#28a745';
+                    setTimeout(() => { selectEl.style.borderColor = '#ccc'; }, 200);
+
+                    let msgObj = {'type': 'switch_view', 'value': selected};
+                    
+                    try {
+                        if (typeof send === 'function') {
+                            send(msgObj);
+                        } else if (window.ws && window.ws.readyState === 1) {
+                            window.ws.send(JSON.stringify(msgObj));
+                        }
+                    } catch (e) {
+                        console.error('WebSocket communication failed:', e);
+                    }
+                };
+
+                // 3. Foolproof Chart Labeler
+                setInterval(() => {
+                    let canvases = document.getElementsByTagName('canvas');
+                    
+                    // Only run if we have both the map canvas and the chart canvas
+                    if (canvases.length > 1) {
+                        // The chart is always the LAST canvas rendered by Mesa
+                        let chartCanvas = canvases[canvases.length - 1];
+                        let chartContainer = chartCanvas.parentElement;
+                        
+                        if(!document.getElementById('thesis-y-axis')) {
+                            chartContainer.style.position = 'relative';
+                            chartContainer.style.padding = '20px 20px 60px 80px'; 
+                            chartContainer.style.marginTop = '30px';
+                            
+                            let yLabel = document.createElement('div');
+                            yLabel.id = 'thesis-y-axis';
+                            yLabel.innerHTML = 'Compliance Rate (%)';
+                            yLabel.style.position = 'absolute';
+                            yLabel.style.left = '-15px'; // Pushed left slightly so it doesn't overlap numbers
+                            yLabel.style.top = '84%';
+                            yLabel.style.transform = 'translateY(-50%) rotate(-90deg)';
+                            yLabel.style.fontWeight = 'bold';
+                            yLabel.style.fontSize = '16px';
+                            yLabel.style.color = '#333';
+                            chartContainer.appendChild(yLabel);
+                            
+                            let xLabel = document.createElement('div');
+                            xLabel.id = 'thesis-x-axis';
+                            xLabel.innerHTML = 'Ticks (Days)';
+                            xLabel.style.position = 'absolute';
+                            xLabel.style.bottom = '10px';
+                            xLabel.style.left = '50%';
+                            xLabel.style.transform = 'translateX(-50%)';
+                            xLabel.style.fontWeight = 'bold';
+                            xLabel.style.fontSize = '16px';
+                            xLabel.style.color = '#333';
+                            chartContainer.appendChild(xLabel);
+                        }
+                    }
+                }, 1000);
+            }
+        ">
         """
 
 # --- 3. Setup Elements ---
-visual_elements = []
-visual_elements.append(ViewSwitcher()) 
-visual_elements.append(Spacer())
+visual_elements = [ViewSwitcher()]
 
-# A. Create the 7 Maps
-for i in range(7):
-    portrayal_fn = make_barangay_portrayal(f"BGY_{i}")
-    grid = CanvasGrid(portrayal_fn, 50, 50, 600, 600)
-    visual_elements.append(grid)
+grid = CanvasGrid(dynamic_portrayal, 50, 50, 600, 600)
+visual_elements.append(grid)
 
-# B. Compliance Chart
 barangay_chart_data = [
     {"Label": "Brgy Poblacion",    "Color": "red"},     
     {"Label": "Brgy Liangan East", "Color": "orange"},  
@@ -226,9 +194,6 @@ barangay_chart_data = [
     {"Label": "Brgy Demologan",    "Color": "purple"}   
 ]
 
-# ==============================================================
-# 1:1 RESOLUTION LOCK (Graph perfectly matches the 1000px container)
-# ==============================================================
 chart_compliance = ChartModule(
     [{"Label": "Global Compliance", "Color": "Black"}] + barangay_chart_data,
     data_collector_name='datacollector',
@@ -237,7 +202,7 @@ chart_compliance = ChartModule(
 )
 visual_elements.append(chart_compliance)
 
-# --- 4. Launch with Policy Choice ---
+# --- 4. Launch ---
 model_params = {
     "seed": 42,
     "train_mode": False,
@@ -245,7 +210,8 @@ model_params = {
         name="LGU Policy Strategy",  
         value="status_quo",      
         choices=["NO_LGU", "status_quo", "pure_incentives", "pure_enforcement", "HuDRL"]
-    )
+    ),
+    "current_view": "BGY_0" 
 }
 
 server = ModularServer(
